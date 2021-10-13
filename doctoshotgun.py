@@ -107,7 +107,7 @@ class CentersPage(HTMLPage):
             # JavaScript:
             # var t = (e = r()(e)).data("u")
             #     , n = atob(t.replace(/\s/g, '').split('').reverse().join(''));
-            
+
             import base64
             href = base64.urlsafe_b64decode(''.join(span.attrib['data-u'].split())[::-1]).decode()
             query = dict(parse.parse_qsl(parse.urlsplit(href).query))
@@ -121,7 +121,7 @@ class CentersPage(HTMLPage):
 
             if 'page' in query:
                 return int(query['page'])
-        
+
         return None
 
 class CenterResultPage(JsonPage):
@@ -214,45 +214,594 @@ class CityNotFound(Exception):
     pass
 
 
-class Doctolib(LoginBrowser):
-    # individual properties for each country. To be defined in subclasses
-    BASEURL = ""
-    vaccine_motives = {}
-    centers = URL('')
-    center = URL('')
-    # common properties
-    login = URL('/login.json', LoginPage)
-    send_auth_code = URL('/api/accounts/send_auth_code', SendAuthCodePage)
-    challenge = URL('/login/challenge', ChallengePage)
-    center_result = URL(r'/search_results/(?P<id>\d+).json', CenterResultPage)
-    center_booking = URL(r'/booking/(?P<center_id>.+).json', CenterBookingPage)
-    availabilities = URL(r'/availabilities.json', AvailabilitiesPage)
-    second_shot_availabilities = URL(
-        r'/second_shot_availabilities.json', AvailabilitiesPage)
-    appointment = URL(r'/appointments.json', AppointmentPage)
-    appointment_edit = URL(
-        r'/appointments/(?P<id>.+)/edit.json', AppointmentEditPage)
-    appointment_post = URL(
-        r'/appointments/(?P<id>.+).json', AppointmentPostPage)
-    master_patient = URL(r'/account/master_patients.json', MasterPatientPage)
+'''
+structural pattern implementation (bridge method)
+Abstraction Tree/Heirarchy, this set of classes are responsible for producing
+different languages for doctoshotgun
+'''
+# This is the root of the abstraction tree. will pass methods to subclasses
+class DoctolibLang:
 
-    def _setup_session(self, profile):
-        session = Session()
+    def do_login(self, code):
+        pass
 
-        session.hooks['response'].append(self.set_normalized_url)
-        if self.responses_dirname is not None:
-            session.hooks['response'].append(self.save_response)
+    def find_centers(self, where, motives=None, page=1):
+        pass
 
-        self.session = session
+    def try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False):
+        pass
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.session.headers['sec-fetch-dest'] = 'document'
-        self.session.headers['sec-fetch-mode'] = 'navigate'
-        self.session.headers['sec-fetch-site'] = 'same-origin'
-        self.session.headers['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.114 Safari/537.36'
+    def try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False):
+        pass
 
-        self.patient = None
+#This is the first subclass of the abstraction tree, it will change text to french for all methods listed below
+class DoctolibFrenchText(LoginBrowser, DoctolibLang):
+
+    def do_login(self, code):
+        try:
+            self.open(self.BASEURL + '/sessions/new')
+        except ServerError as e:
+            if e.response.status_code in [503] \
+                and 'text/html' in e.response.headers['Content-Type'] \
+                    and ('cloudflare' in e.response.text or 'Checking your browser before accessing' in e .response.text):
+                log('Demande bloquée par CloudFlare', color='red')
+            if e.response.status_code in [520]:
+                log('Cloudflare ne parvient pas à se connecter au serveur Doctolib. Veuillez réessayer ultérieurement.', color='red')
+            raise
+        try:
+            self.login.go(json={'kind': 'patient',
+                                'username': self.username,
+                                'password': self.password,
+                                'remember': True,
+                                'remember_username': True})
+        except ClientError:
+            print("Nom d'utilisateur / mot de passe incorrect")
+            return False
+
+        if self.page.redirect() == "/sessions/two-factor":
+            print("Requesting 2fa code...")
+            if not code:
+                if not sys.__stdin__.isatty():
+                    log("Saisie du code d'authentification requise, mais pas de borne interactive disponible. Veuillez le spécifier en utilisant l'argument de ligne de commande '--code'.", color='red')
+                    return False
+                self.send_auth_code.go(
+                    json={'two_factor_auth_method': 'email'}, method="POST")
+                code = input("Enter auth code: ")
+            try:
+                self.challenge.go(
+                    json={'auth_code': code, 'two_factor_auth_method': 'email'}, method="POST")
+            except HTTPNotFound:
+                print("Code d'authentification invalide")
+                return False
+
+        return True
+
+    def find_centers(self, where, motives=None, page=1):
+        if motives is None:
+            motives = self.vaccine_motives.keys()
+        for city in where:
+            try:
+                self.centers.go(where=city, params={
+                                'ref_visit_motive_ids[]': motives, 'page': page})
+            except ServerError as e:
+                if e.response.status_code in [503]:
+                    if 'text/html' in e.response.headers['Content-Type'] \
+                        and ('cloudflare' in e.response.text or
+                             "Vérifiez votre navigateur avant d'y accéder" in e .response.text):
+                        log('Demande bloquée par CloudFlare', color='red')
+                    return
+                if e.response.status_code in [520]:
+                    log('Cloudflare ne peut pas se connecter au serveur Doctolib. Veuillez réessayer plus tard.', color='red')
+                    return
+                raise
+            except HTTPNotFound as e:
+                raise CityNotFound(city) from e
+
+            next_page = self.page.get_next_page()
+
+            for i in self.page.iter_centers_ids():
+                page = self.center_result.open(
+                    id=i,
+                    params={
+                        'limit': '4',
+                        'ref_visit_motive_ids[]': motives,
+                        'speciality_id': '5494',
+                        'search_result_format': 'json'
+                    }
+                )
+                try:
+                    yield page.doc['search_result']
+                except KeyError:
+                    pass
+
+            if next_page:
+                for center in self.find_centers(where, motives, next_page):
+                    yield center
+
+    def try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False):
+        self.open(center['url'])
+        p = urlparse(center['url'])
+        center_id = p.path.split('/')[-1]
+        center_page = self.center_booking.go(center_id=center_id)
+        profile_id = self.page.get_profile_id()
+        # extract motive ids based on the vaccine names
+        motives_id = dict()
+        for vaccine in vaccine_list:
+            motives_id[vaccine] = self.page.find_motive(
+                r'.*({})'.format(vaccine), singleShot=(vaccine == self.vaccine_motives[self.KEY_JANSSEN] or only_second or only_third))
+
+        motives_id = dict((k, v)
+                          for k, v in motives_id.items() if v is not None)
+        if len(motives_id.values()) == 0:
+            log('Les vaccins demandés sont introuvables dans les motifs')
+            log('Motifs: %s', ', '.join(self.page.get_motives()))
+            return False
+
+        for place in self.page.get_places():
+            if place['name']:
+                log('– %s...', place['name'])
+            practice_id = place['practice_ids'][0]
+            for vac_name, motive_id in motives_id.items():
+                log('  Vaccine %s...', vac_name, end=' ', flush=True)
+                agenda_ids = center_page.get_agenda_ids(motive_id, practice_id)
+                if len(agenda_ids) == 0:
+                    # do not filter to give a chance
+                    agenda_ids = center_page.get_agenda_ids(motive_id)
+
+                if self.try_to_book_place(profile_id, motive_id, practice_id, agenda_ids, vac_name.lower(), start_date, end_date, only_second, only_third, dry_run):
+
+                    return True
+
+        return False
+
+    def try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False):
+        date = start_date.strftime('%Y-%m-%d')
+        while date is not None:
+            self.availabilities.go(
+                params={'start_date': date,
+                        'visit_motive_ids': motive_id,
+                        'agenda_ids': '-'.join(agenda_ids),
+                        'insurance_sector': 'public',
+                        'practice_ids': practice_id,
+                        'destroy_temporary': 'true',
+                        'limit': 3})
+            if 'next_slot' in self.page.doc:
+                date = self.page.doc['next_slot']
+            else:
+                date = None
+
+        if len(self.page.doc['availabilities']) == 0:
+            log('pas de disponibilités', color='red')
+            return False
+
+        slot = self.page.find_best_slot(start_date, end_date)
+        if not slot:
+            if only_second == False and only_third == False:
+                log('Premier emplacement introuvable :(', color='red')
+            else:
+                log('Emplacement introuvable :(', color='red')
+            return False
+
+        # depending on the country, the slot is returned in a different format. Go figure...
+        if isinstance(slot, dict) and 'start_date' in slot:
+            slot_date_first = slot['start_date']
+            if vac_name != "janssen":
+                slot_date_second = slot['steps'][1]['start_date']
+        elif isinstance(slot, str):
+            if vac_name != "janssen" and not only_second and not only_third:
+                log('Un seul créneau trouvé pour la vaccination multi-injections')
+            # should be for Janssen, second or third shots only, otherwise it is a list
+            slot_date_first = slot
+        elif isinstance(slot, list):
+            slot_date_first = slot[0]
+            if vac_name != "janssen":  # maybe redundant?
+                slot_date_second = slot[1]
+        else:
+            log("Échec de l'obtention du premier emplacement.", color='red')
+            return False
+        if vac_name != "janssen" and not only_second and not only_third:
+            assert slot_date_second
+        log('trouvé!', color='green')
+        log('  ├╴ Meilleur emplacement trouvé : %s', parse_date(
+            slot_date_first).strftime('%c'))
+
+        appointment = {'profile_id':    profile_id,
+                       'source_action': 'profile',
+                       'start_date':    slot_date_first,
+                       'visit_motive_ids': str(motive_id),
+                       }
+
+        data = {'agenda_ids': '-'.join(agenda_ids),
+                'appointment': appointment,
+                'practice_ids': [practice_id]}
+
+        headers = {
+            'content-type': 'application/json',
+        }
+        self.appointment.go(data=json.dumps(data), headers=headers)
+
+        if self.page.is_error():
+            log("  └╴ Rendez-vous n'est plus disponible :( :( %s", self.page.get_error())
+            return False
+
+        playsound('ding.mp3')
+
+        if vac_name != "janssen" and not only_second and not only_third:  # janssen has only one shot
+            self.second_shot_availabilities.go(
+                params={'start_date': slot_date_second.split('T')[0],
+                        'visit_motive_ids': motive_id,
+                        'agenda_ids': '-'.join(agenda_ids),
+                        'first_slot': slot_date_first,
+                        'insurance_sector': 'public',
+                        'practice_ids': practice_id,
+                        'limit': 3})
+
+            second_slot = self.page.find_best_slot()
+            if not second_slot:
+                log('  └╴ Pas de deuxième coup trouvé')
+                return False
+
+            # in theory we could use the stored slot_date_second result from above,
+            # but we refresh with the new results to play safe
+            if isinstance(second_slot, dict) and 'start_date' in second_slot:
+                slot_date_second = second_slot['start_date']
+            elif isinstance(slot, str):
+                slot_date_second = second_slot
+            # TODO: is this else needed?
+            # elif isinstance(slot, list):
+            #    slot_date_second = second_slot[1]
+            else:
+                log("Échec de l'obtention du deuxième emplacement.", color='red')
+                return False
+
+            log('  ├╴ Deuxième coup: %s', parse_date(
+                slot_date_second).strftime('%c'))
+
+            data['second_slot'] = slot_date_second
+            self.appointment.go(data=json.dumps(data), headers=headers)
+
+            if self.page.is_error():
+                log("  └╴ Rendez-vous n'est plus disponible :( %s",
+                    self.page.get_error())
+                return False
+
+        a_id = self.page.doc['id']
+
+        self.appointment_edit.go(id=a_id)
+
+        log('  ├╴ Réservation pour %(first_name)s %(last_name)s...' % self.patient)
+
+        self.appointment_edit.go(
+            id=a_id, params={'master_patient_id': self.patient['id']})
+
+        custom_fields = {}
+        for field in self.page.get_custom_fields():
+            if field['id'] == 'cov19':
+                value = 'Non'
+            elif field['placeholder']:
+                value = field['placeholder']
+            else:
+                print('%s (%s):' %
+                      (field['label'], field['placeholder']), end=' ', flush=True)
+                value = sys.stdin.readline().strip()
+
+            custom_fields[field['id']] = value
+
+        if dry_run:
+            log('  └╴ Statut de réservation: %s', 'faux')
+            return True
+
+        data = {'appointment': {'custom_fields_values': custom_fields,
+                                'new_patient': True,
+                                'qualification_answers': {},
+                                'referrer_id': None,
+                                },
+                'bypass_mandatory_relative_contact_info': False,
+                'email': None,
+                'master_patient': self.patient,
+                'new_patient': True,
+                'patient': None,
+                'phone_number': None,
+                }
+
+        self.appointment_post.go(id=a_id, data=json.dumps(
+            data), headers=headers, method='PUT')
+
+        if 'redirection' in self.page.doc and not 'confirmed-appointment' in self.page.doc['redirection']:
+            log('  ├╴ offen %s fertigstellen', self.BASEURL +
+                self.page.doc['redirection'])
+
+        self.appointment_post.go(id=a_id)
+
+        log('  └╴ Statut de réservation: %s', self.page.doc['confirmed'])
+
+        return self.page.doc['confirmed']
+
+#This is the first subclass of the abstraction tree, it will change text to German for all methods listed below
+class DoctolibGermanText(LoginBrowser, DoctolibLang):
+
+    def do_login(self, code):
+        try:
+            self.open(self.BASEURL + '/sessions/new')
+        except ServerError as e:
+            if e.response.status_code in [503] \
+                and 'text/html' in e.response.headers['Content-Type'] \
+                    and ('cloudflare' in e.response.text or 'Checking your browser before accessing' in e .response.text):
+                log('Anfrage von CloudFlare blockiert', color='red')
+            if e.response.status_code in [520]:
+                log('Cloudflare kann keine Verbindung zum Doctolib-Server herstellen. Bitte versuchen Sie es später erneut.', color='red')
+            raise
+        try:
+            self.login.go(json={'kind': 'patient',
+                                'username': self.username,
+                                'password': self.password,
+                                'remember': True,
+                                'remember_username': True})
+        except ClientError:
+            print('Falscher Login/Passwort')
+            return False
+
+        if self.page.redirect() == "/sessions/two-factor":
+            print("Requesting 2fa code...")
+            if not code:
+                if not sys.__stdin__.isatty():
+                    log("Auth-Code-Eingabe erforderlich, aber kein interaktives Terminal verfügbar. Bitte geben Sie es über das Befehlszeilenargument an '--code'.", color='red')
+                    return False
+                self.send_auth_code.go(
+                    json={'two_factor_auth_method': 'email'}, method="POST")
+                code = input("Enter auth code: ")
+            try:
+                self.challenge.go(
+                    json={'auth_code': code, 'two_factor_auth_method': 'email'}, method="POST")
+            except HTTPNotFound:
+                print("Ungültiger Authentifizierungscode")
+                return False
+
+        return True
+
+    def find_centers(self, where, motives=None, page=1):
+        if motives is None:
+            motives = self.vaccine_motives.keys()
+        for city in where:
+            try:
+                self.centers.go(where=city, params={
+                                'ref_visit_motive_ids[]': motives, 'page': page})
+            except ServerError as e:
+                if e.response.status_code in [503]:
+                    if 'text/html' in e.response.headers['Content-Type'] \
+                        and ('cloudflare' in e.response.text or
+                             'Überprüfen Sie Ihren Browser, bevor Sie darauf zugreifen' in e .response.text):
+                        log('Anfrage von CloudFlare blockiert', color='red')
+                    return
+                if e.response.status_code in [520]:
+                    log('Cloudflare kann keine Verbindung zum Doctolib-Server herstellen. Bitte versuchen Sie es später erneut.', color='red')
+                    return
+                raise
+            except HTTPNotFound as e:
+                raise CityNotFound(city) from e
+
+            next_page = self.page.get_next_page()
+
+            for i in self.page.iter_centers_ids():
+                page = self.center_result.open(
+                    id=i,
+                    params={
+                        'limit': '4',
+                        'ref_visit_motive_ids[]': motives,
+                        'speciality_id': '5494',
+                        'search_result_format': 'json'
+                    }
+                )
+                try:
+                    yield page.doc['search_result']
+                except KeyError:
+                    pass
+
+            if next_page:
+                for center in self.find_centers(where, motives, next_page):
+                    yield center
+
+    def try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False):
+        self.open(center['url'])
+        p = urlparse(center['url'])
+        center_id = p.path.split('/')[-1]
+        center_page = self.center_booking.go(center_id=center_id)
+        profile_id = self.page.get_profile_id()
+        # extract motive ids based on the vaccine names
+        motives_id = dict()
+        for vaccine in vaccine_list:
+            motives_id[vaccine] = self.page.find_motive(
+                r'.*({})'.format(vaccine), singleShot=(vaccine == self.vaccine_motives[self.KEY_JANSSEN] or only_second or only_third))
+
+        motives_id = dict((k, v)
+                          for k, v in motives_id.items() if v is not None)
+        if len(motives_id.values()) == 0:
+            log('Angeforderte Impfstoffe können nicht in Motiven gefunden werden')
+            log('Motives: %s', ', '.join(self.page.get_motives()))
+            return False
+
+        for place in self.page.get_places():
+            if place['name']:
+                log('– %s...', place['name'])
+            practice_id = place['practice_ids'][0]
+            for vac_name, motive_id in motives_id.items():
+                log('  Vaccine %s...', vac_name, end=' ', flush=True)
+                agenda_ids = center_page.get_agenda_ids(motive_id, practice_id)
+                if len(agenda_ids) == 0:
+                    # do not filter to give a chance
+                    agenda_ids = center_page.get_agenda_ids(motive_id)
+
+                if self.try_to_book_place(profile_id, motive_id, practice_id, agenda_ids, vac_name.lower(), start_date, end_date, only_second, only_third, dry_run):
+
+                    return True
+
+        return False
+
+    def try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False):
+        date = start_date.strftime('%Y-%m-%d')
+        while date is not None:
+            self.availabilities.go(
+                params={'start_date': date,
+                        'visit_motive_ids': motive_id,
+                        'agenda_ids': '-'.join(agenda_ids),
+                        'insurance_sector': 'public',
+                        'practice_ids': practice_id,
+                        'destroy_temporary': 'true',
+                        'limit': 3})
+            if 'next_slot' in self.page.doc:
+                date = self.page.doc['next_slot']
+            else:
+                date = None
+
+        if len(self.page.doc['availabilities']) == 0:
+            log('keine Verfügbarkeiten', color='red')
+            return False
+
+        slot = self.page.find_best_slot(start_date, end_date)
+        if not slot:
+            if only_second == False and only_third == False:
+                log('Erster Steckplatz nicht gefunden :(', color='red')
+            else:
+                log('Steckplatz nicht gefunden :(', color='red')
+            return False
+
+        # depending on the country, the slot is returned in a different format. Go figure...
+        if isinstance(slot, dict) and 'start_date' in slot:
+            slot_date_first = slot['start_date']
+            if vac_name != "janssen":
+                slot_date_second = slot['steps'][1]['start_date']
+        elif isinstance(slot, str):
+            if vac_name != "janssen" and not only_second and not only_third:
+                log('Nur ein Slot für Multi-Shot-Impfung gefunden')
+            # should be for Janssen, second or third shots only, otherwise it is a list
+            slot_date_first = slot
+        elif isinstance(slot, list):
+            slot_date_first = slot[0]
+            if vac_name != "janssen":  # maybe redundant?
+                slot_date_second = slot[1]
+        else:
+            log('Fehler beim Abrufen des ersten Slots.', color='red')
+            return False
+        if vac_name != "janssen" and not only_second and not only_third:
+            assert slot_date_second
+        log('gefunden!', color='green')
+        log('  ├╴ Bester Slot gefunden: %s', parse_date(
+            slot_date_first).strftime('%c'))
+
+        appointment = {'profile_id':    profile_id,
+                       'source_action': 'profile',
+                       'start_date':    slot_date_first,
+                       'visit_motive_ids': str(motive_id),
+                       }
+
+        data = {'agenda_ids': '-'.join(agenda_ids),
+                'appointment': appointment,
+                'practice_ids': [practice_id]}
+
+        headers = {
+            'content-type': 'application/json',
+        }
+        self.appointment.go(data=json.dumps(data), headers=headers)
+
+        if self.page.is_error():
+            log('  └╴ Termin nicht mehr verfügbar :( :( %s', self.page.get_error())
+            return False
+
+        playsound('ding.mp3')
+
+        if vac_name != "janssen" and not only_second and not only_third:  # janssen has only one shot
+            self.second_shot_availabilities.go(
+                params={'start_date': slot_date_second.split('T')[0],
+                        'visit_motive_ids': motive_id,
+                        'agenda_ids': '-'.join(agenda_ids),
+                        'first_slot': slot_date_first,
+                        'insurance_sector': 'public',
+                        'practice_ids': practice_id,
+                        'limit': 3})
+
+            second_slot = self.page.find_best_slot()
+            if not second_slot:
+                log('  └╴ Kein zweiter Schuss gefunden')
+                return False
+
+            # in theory we could use the stored slot_date_second result from above,
+            # but we refresh with the new results to play safe
+            if isinstance(second_slot, dict) and 'start_date' in second_slot:
+                slot_date_second = second_slot['start_date']
+            elif isinstance(slot, str):
+                slot_date_second = second_slot
+            # TODO: is this else needed?
+            # elif isinstance(slot, list):
+            #    slot_date_second = second_slot[1]
+            else:
+                log('Fehler beim Abrufen des zweiten Slots.', color='red')
+                return False
+
+            log('  ├╴ Zweiter Schuss: %s', parse_date(
+                slot_date_second).strftime('%c'))
+
+            data['second_slot'] = slot_date_second
+            self.appointment.go(data=json.dumps(data), headers=headers)
+
+            if self.page.is_error():
+                log('  └╴ Termin nicht mehr verfügbar :( %s',
+                    self.page.get_error())
+                return False
+
+        a_id = self.page.doc['id']
+
+        self.appointment_edit.go(id=a_id)
+
+        log('  ├╴ Buchung für %(first_name)s %(last_name)s...' % self.patient)
+
+        self.appointment_edit.go(
+            id=a_id, params={'master_patient_id': self.patient['id']})
+
+        custom_fields = {}
+        for field in self.page.get_custom_fields():
+            if field['id'] == 'cov19':
+                value = 'Non'
+            elif field['placeholder']:
+                value = field['placeholder']
+            else:
+                print('%s (%s):' %
+                      (field['label'], field['placeholder']), end=' ', flush=True)
+                value = sys.stdin.readline().strip()
+
+            custom_fields[field['id']] = value
+
+        if dry_run:
+            log('  └╴ Buchungsstatus: %s', 'gefälscht')
+            return True
+
+        data = {'appointment': {'custom_fields_values': custom_fields,
+                                'new_patient': True,
+                                'qualification_answers': {},
+                                'referrer_id': None,
+                                },
+                'bypass_mandatory_relative_contact_info': False,
+                'email': None,
+                'master_patient': self.patient,
+                'new_patient': True,
+                'patient': None,
+                'phone_number': None,
+                }
+
+        self.appointment_post.go(id=a_id, data=json.dumps(
+            data), headers=headers, method='PUT')
+
+        if 'redirection' in self.page.doc and not 'confirmed-appointment' in self.page.doc['redirection']:
+            log('  ├╴ offen %s fertigstellen', self.BASEURL +
+                self.page.doc['redirection'])
+
+        self.appointment_post.go(id=a_id)
+
+        log('  └╴ Buchungsstatus: %s', self.page.doc['confirmed'])
+
+        return self.page.doc['confirmed']
+
+#This is the first subclass of the abstraction tree, it will change text to English for all methods listed below
+class DoctolibEnglishText(LoginBrowser, DoctolibLang):
 
     def do_login(self, code):
         try:
@@ -334,19 +883,6 @@ class Doctolib(LoginBrowser):
             if next_page:
                 for center in self.find_centers(where, motives, next_page):
                     yield center
-
-    def get_patients(self):
-        self.master_patient.go()
-
-        return self.page.get_patients()
-
-    @classmethod
-    def normalize(cls, string):
-        nfkd = unicodedata.normalize('NFKD', string)
-        normalized = u"".join(
-            [c for c in nfkd if not unicodedata.combining(c)])
-        normalized = re.sub(r'\W', '-', normalized)
-        return normalized.lower()
 
     def try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False):
         self.open(center['url'])
@@ -547,8 +1083,107 @@ class Doctolib(LoginBrowser):
 
         return self.page.doc['confirmed']
 
+#This is the root class of the Implementer tree, it will pass methods to subclasses
+class Doctolib(LoginBrowser):
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session.headers['sec-fetch-dest'] = 'document'
+        self.session.headers['sec-fetch-mode'] = 'navigate'
+        self.session.headers['sec-fetch-site'] = 'same-origin'
+        self.session.headers['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.114 Safari/537.36'
+        self.GermanText = DoctolibGermanText
+        self.EnglishText = DoctolibEnglishText
+        self.patient = None
+
+    BASEURL = ""
+    vaccine_motives = {}
+
+    centers = URL('')
+    center = URL('')
+    # common properties
+    login = URL('/login.json', LoginPage)
+    send_auth_code = URL('/api/accounts/send_auth_code', SendAuthCodePage)
+    challenge = URL('/login/challenge', ChallengePage)
+    center_result = URL(r'/search_results/(?P<id>\d+).json', CenterResultPage)
+    center_booking = URL(r'/booking/(?P<center_id>.+).json', CenterBookingPage)
+    availabilities = URL(r'/availabilities.json', AvailabilitiesPage)
+    second_shot_availabilities = URL(
+        r'/second_shot_availabilities.json', AvailabilitiesPage)
+    appointment = URL(r'/appointments.json', AppointmentPage)
+    appointment_edit = URL(
+        r'/appointments/(?P<id>.+)/edit.json', AppointmentEditPage)
+    appointment_post = URL(
+        r'/appointments/(?P<id>.+).json', AppointmentPostPage)
+    master_patient = URL(r'/account/master_patients.json', MasterPatientPage)
+
+
+    def _setup_session(self, profile):
+        pass
+
+    def return_username(self):
+        pass
+
+    def get_patients(self):
+        pass
+
+    def normalize(cls, string):
+        pass
+#This is the first subclass of the implenter tree, it will implement a language object from the abstraction tree
 class DoctolibDE(Doctolib):
+
+    def _setup_session(self, profile):
+        session = Session()
+
+        session.hooks['response'].append(self.set_normalized_url)
+        if self.responses_dirname is not None:
+            session.hooks['response'].append(self.save_response)
+
+        self.session = session
+
+        def __init__(self, GermanText, *args, **kwargs):
+            super().__init__(GermanText, *args, **kwargs)
+            self.session.headers['sec-fetch-dest'] = 'document'
+            self.session.headers['sec-fetch-mode'] = 'navigate'
+            self.session.headers['sec-fetch-site'] = 'same-origin'
+            self.session.headers['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.114 Safari/537.36'
+            self.GermanText = DoctolibGermanText
+            self.patient = None
+
+
+    def do_login(self, code):
+        return self.GermanText.do_login(self, code)
+
+    def return_username(self):
+        return self.username
+
+    def find_centers(self, where, motives=None, page=1):
+        return self.GermanText.find_centers(self, where, motives=None, page=1)
+
+
+    def get_patients(self):
+        self.master_patient.go()
+
+        return self.page.get_patients()
+
+    @classmethod
+    def normalize(cls, string):
+        nfkd = unicodedata.normalize('NFKD', string)
+        normalized = u"".join(
+            [c for c in nfkd if not unicodedata.combining(c)])
+        normalized = re.sub(r'\W', '-', normalized)
+        return normalized.lower()
+
+
+    def try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False):
+
+        return self.GermanText.try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False)
+
+    def try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False):
+
+        return self.GermanText.try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False)
+
+
     BASEURL = 'https://www.doctolib.de'
     KEY_PFIZER = '6768'
     KEY_PFIZER_SECOND = '6769'
@@ -572,9 +1207,62 @@ class DoctolibDE(Doctolib):
     }
     centers = URL(r'/impfung-covid-19-corona/(?P<where>\w+)', CentersPage)
     center = URL(r'/praxis/.*', CenterPage)
-
-
+#This is the first subclass of the implenter tree, it will implement a language object from the abstraction tree
 class DoctolibFR(Doctolib):
+
+
+    def _setup_session(self, profile):
+        session = Session()
+
+        session.hooks['response'].append(self.set_normalized_url)
+        if self.responses_dirname is not None:
+            session.hooks['response'].append(self.save_response)
+
+        self.session = session
+
+        def __init__(self, EnglishText, *args, **kwargs):
+            super().__init__(EnglishText, *args, **kwargs)
+            self.session.headers['sec-fetch-dest'] = 'document'
+            self.session.headers['sec-fetch-mode'] = 'navigate'
+            self.session.headers['sec-fetch-site'] = 'same-origin'
+            self.session.headers['User-Agent'] = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.114 Safari/537.36'
+            self.EnglishText = DoctolibEnglishText
+            self.patient = None
+
+
+    def do_login(self, code):
+        return self.EnglishText.do_login(self, code)
+
+    def return_username(self):
+        return self.username
+
+    def find_centers(self, where, motives=None, page=1):
+        return self.EnglishText.find_centers(self, where, motives=None, page=1)
+
+
+    def get_patients(self):
+        self.master_patient.go()
+
+        return self.page.get_patients()
+
+    @classmethod
+    def normalize(cls, string):
+        nfkd = unicodedata.normalize('NFKD', string)
+        normalized = u"".join(
+            [c for c in nfkd if not unicodedata.combining(c)])
+        normalized = re.sub(r'\W', '-', normalized)
+        return normalized.lower()
+
+
+    def try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False):
+
+        return self.EnglishText.try_to_book(self, center, vaccine_list, start_date, end_date, only_second, only_third, dry_run=False)
+
+    def try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False):
+
+        return self.EnglishText.try_to_book_place(self, profile_id, motive_id, practice_id, agenda_ids, vac_name, start_date, end_date, only_second, only_third, dry_run=False)
+
+
     BASEURL = 'https://www.doctolib.fr'
     KEY_PFIZER = '6970'
     KEY_PFIZER_SECOND = '6971'
@@ -599,7 +1287,6 @@ class DoctolibFR(Doctolib):
 
     centers = URL(r'/vaccination-covid-19/(?P<where>\w+)', CentersPage)
     center = URL(r'/centre-de-sante/.*', CenterPage)
-
 
 class Application:
     @classmethod
